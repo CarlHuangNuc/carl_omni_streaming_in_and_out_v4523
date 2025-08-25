@@ -19,7 +19,7 @@ Processor class for Qwen2.5Omni.
 
 import logging
 import re
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 
@@ -31,7 +31,7 @@ from ...video_utils import VideoInput, make_batched_videos
 
 
 class Qwen2_5_OmniVideosKwargs(VideosKwargs):
-    fps: Optional[List[int]] = None
+    fps: Optional[list[int]] = None
     use_audio_in_video: Optional[bool] = None
     seconds_per_chunk: Optional[float] = None
     position_id_per_seconds: Optional[int] = None
@@ -97,7 +97,6 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
     video_processor_class = "Qwen2VLVideoProcessor"
     feature_extractor_class = "WhisperFeatureExtractor"
     tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast")
-    valid_kwargs = ["chat_template"]
 
     def __init__(
         self, image_processor=None, video_processor=None, feature_extractor=None, tokenizer=None, chat_template=None
@@ -110,10 +109,13 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
         self.vision_eos_token = self.tokenizer.vision_eos_token
         self.audio_bos_token = self.tokenizer.audio_bos_token
         self.audio_eos_token = self.tokenizer.audio_eos_token
+        self.stream = False
+        self.first_slice = False
+        self.end_slice = False
 
     def __call__(
         self,
-        text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
+        text: Union[TextInput, PreTokenizedInput, list[TextInput], list[PreTokenizedInput]] = None,
         images: ImageInput = None,
         videos: VideoInput = None,
         audio: AudioInput = None,
@@ -129,17 +131,17 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
         of the above two methods for more information.
 
         Args:
-            text (`str`, `List[str]`, `List[List[str]]`):
+            text (`str`, `list[str]`, `list[list[str]]`):
                 The sequence or batch of sequences to be encoded. Each sequence can be a string or a list of strings
                 (pretokenized string). If the sequences are provided as list of strings (pretokenized), you must set
                 `is_split_into_words=True` (to lift the ambiguity with a batch of sequences).
-            images (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`, `List[PIL.Image.Image]`, `List[np.ndarray]`, `List[torch.Tensor]`):
+            images (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`, `list[PIL.Image.Image]`, `list[np.ndarray]`, `list[torch.Tensor]`):
                 The image or batch of images to be prepared. Each image can be a PIL image, NumPy array or PyTorch
                 tensor. Both channels-first and channels-last formats are supported.
-            videos (`np.ndarray`, `torch.Tensor`, `List[np.ndarray]`, `List[torch.Tensor]`):
+            videos (`np.ndarray`, `torch.Tensor`, `list[np.ndarray]`, `list[torch.Tensor]`):
                 The image or batch of videos to be prepared. Each video can be a 4D NumPy array or PyTorch
                 tensor, or a nested list of 3D frames. Both channels-first and channels-last formats are supported.
-            audio (`np.ndarray`, `List[np.ndarray]`):
+            audio (`np.ndarray`, `list[np.ndarray]`):
                 The audio or batch of audio to be prepared. Each audio can be a NumPy array.
         """
 
@@ -152,10 +154,17 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
             **kwargs,
         )
 
+        if "stream" in kwargs:
+            self.stream = kwargs["stream"]
+        if "first_slice" in kwargs:
+            self.first_slice = kwargs["first_slice"]
+        if "end_slice" in kwargs:
+            self.end_slice = kwargs["end_slice"]
+
         seconds_per_chunk = output_kwargs["videos_kwargs"].pop("seconds_per_chunk")
         position_id_per_seconds = output_kwargs["videos_kwargs"].pop("position_id_per_seconds")
         use_audio_in_video = output_kwargs["videos_kwargs"].pop("use_audio_in_video")
-        fps = output_kwargs["videos_kwargs"].pop("fps", 2.0)
+        fps = output_kwargs["videos_kwargs"].get("fps", 2.0)
 
         if audio is not None:
             output_kwargs["audio_kwargs"]["padding"] = "max_length"  # Support "max_length" padding only here
@@ -207,12 +216,46 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
             seconds_per_chunk=seconds_per_chunk,
         )
 
+        #### carl add 
+        if self.stream:
+            ret_text=[]
+            for tmptext in text:
+                before, mid, after=self.split_audio_tags(tmptext)
+                new_str = []
+                if self.first_slice and not self.end_slice:    
+                    new_str.append(before+mid+"<|audio_eos|>")
+                elif self.end_slice and not self.first_slice:
+                    new_str.append("<|audio_bos|>"+ mid+ "<|audio_eos|><|im_end|>\n<|im_start|>assistant\n")
+                else:  
+                    new_str.append("<|audio_bos|>" +mid+ "<|audio_eos|>")
+                ret_text.append(new_str[0])
+       
+            text = ret_text
         texts_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
-
         return BatchFeature(
             data={**texts_inputs, **images_inputs, **videos_inputs, **audio_inputs},
             tensor_type=kwargs.get("return_tensors"),
         )
+
+
+    def split_audio_tags(self,text):
+        """查找字符串中第一个和最后一个<|AUDIO|>的位置，并分割字符串为三部分"""
+        # 查找第一个<|AUDIO|>的位置
+        first_pos = text.find('<|AUDIO|>')                    
+        if first_pos == -1:
+            # 如果没找到任何<|AUDIO|>标签
+            return text, '', ''                                            
+        # 查找最后一个<|AUDIO|>的位置
+        last_pos = text.rfind('<|AUDIO|>')
+        # 计算最后一个标签的结束位置
+        last_end = last_pos + len('<|AUDIO|>')
+        #first_pos = first_pos - len('<|AUDIO|>')
+        # 分割字符串
+        part1 = text[:first_pos]
+        part2 = text[first_pos:last_end]
+        part3 = text[last_end:]
+        return part1, part2, part3
+
 
     def replace_multimodal_special_tokens(
         self,
@@ -225,6 +268,7 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
         position_id_per_seconds,
         seconds_per_chunk,
     ):
+
         # Extend mm token length
         merge_length_image = self.image_processor.merge_size**2
         merge_length_video = self.video_processor.merge_size**2
@@ -301,7 +345,7 @@ class Qwen2_5OmniProcessor(ProcessorMixin):
             t_ntoken_per_chunk (`int`): Number of tokens per chunk (used as the chunk size threshold).
 
         Returns:
-            `List[Tuple[int, int]]`: A list of tuples, each representing the start (inclusive)
+            `list[tuple[int, int]]`: A list of tuples, each representing the start (inclusive)
                                 and end (exclusive) indices of a chunk in `token_indices`.
         """
 
